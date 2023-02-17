@@ -28,11 +28,15 @@
 #include <ctype.h>
 #include <wchar.h>
 #include "cdbase.h"
+#include "cs2.h"
 #include "error.h"
 #include "debug.h"
 #include "junzip.h"
 #include "zlib.h"
-#include <libchdr/chd.h>
+#ifdef ENABLE_CHD
+// Don't rely on libretro-common's chdr lib, somehow it's breaking this chd stuff
+#include "libchdr/chd.h"
+#endif
 
 #include "streams/file_stream.h"
 #include "compat/posix_string.h"
@@ -45,6 +49,7 @@ static int DummyCDInit(const char *);
 static void DummyCDDeInit(void);
 static int DummyCDGetStatus(void);
 static s32 DummyCDReadTOC(u32 *);
+static s32 DummyCDReadTOC10(CDInterfaceToc10 *);
 static int DummyCDReadSectorFAD(u32, void *);
 static void DummyCDReadAheadFAD(u32);
 static void DummyCDSetStatus(int status );
@@ -56,6 +61,7 @@ DummyCDInit,
 DummyCDDeInit,
 DummyCDGetStatus,
 DummyCDReadTOC,
+DummyCDReadTOC10,
 DummyCDReadSectorFAD,
 DummyCDReadAheadFAD,
 DummyCDSetStatus,
@@ -65,6 +71,7 @@ static int ISOCDInit(const char *);
 static void ISOCDDeInit(void);
 static int ISOCDGetStatus(void);
 static s32 ISOCDReadTOC(u32 *);
+static s32 ISOCDReadTOC10(CDInterfaceToc10 *);
 static int ISOCDReadSectorFAD(u32, void *);
 static void ISOCDReadAheadFAD(u32);
 static void ISOCDSetStatus(int status);
@@ -76,6 +83,7 @@ ISOCDInit,
 ISOCDDeInit,
 ISOCDGetStatus,
 ISOCDReadTOC,
+ISOCDReadTOC10,
 ISOCDReadSectorFAD,
 ISOCDReadAheadFAD,
 ISOCDSetStatus,
@@ -168,6 +176,13 @@ static s32 DummyCDReadTOC(UNUSED u32 *TOC)
 	//
 	// Special Note: To convert from LBA/LSN to FAD, add 150.
 
+	return 0;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+static s32 DummyCDReadTOC10(UNUSED CDInterfaceToc10 *TOC)
+{
 	return 0;
 }
 
@@ -339,6 +354,8 @@ static const s8 syncHdr[12] = { 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 
 enum IMG_TYPE { IMG_NONE, IMG_ISO, IMG_BINCUE, IMG_MDS, IMG_CCD, IMG_CHD, IMG_NRG };
 enum IMG_TYPE imgtype = IMG_ISO;
 static u32 isoTOC[102];
+static CDInterfaceToc10 isoTOC10[102];
+int isoTOCnum=0;
 static disc_info_struct disc;
 static int iso_cd_status = 0;
 
@@ -430,8 +447,10 @@ static RFILE* OpenFile(char* buffer, const char* cue) {
    return ret_file;
 }
 
+#ifdef ENABLE_CHD
 static int LoadCHD(const char *chd_filename, RFILE *iso_file);
 static int ISOCDReadSectorFADFromCHD(u32 FAD, void *buffer);
+#endif
 
 static int LoadBinCue(const char *cuefilename, RFILE *iso_file)
 {
@@ -593,7 +612,7 @@ static int LoadBinCue(const char *cuefilename, RFILE *iso_file)
    return 0;
 }
 
-
+#ifdef ENABLE_ZLIB 
 int infoFile(JZFile *zip, int idx, JZFileHeader *header, char *filename, void *user_data) {
     long offset;
     char name[1024];
@@ -904,6 +923,7 @@ static int LoadBinCueInZip(const char *filename, RFILE *fp)
 
    return 0;
 }
+#endif
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -1384,6 +1404,18 @@ static int LoadCCD(const char *ccd_filename, RFILE *iso_file)
 		int point;
 
 		sprintf(sect_name, "Entry %d", i);
+
+		isoTOC10[i].ctrladr = (GetIntCCD(&ccd, sect_name, "Control") << 4) | GetIntCCD(&ccd, sect_name, "ADR");
+		isoTOC10[i].tno = GetIntCCD(&ccd, sect_name, "TrackNo");
+		isoTOC10[i].point = GetIntCCD(&ccd, sect_name, "Point");
+		isoTOC10[i].min = GetIntCCD(&ccd, sect_name, "AMin");
+		isoTOC10[i].sec = 2;
+		isoTOC10[i].frame = 0;
+		isoTOC10[i].zero = GetIntCCD(&ccd, sect_name, "Zero");
+		isoTOC10[i].pmin = GetIntCCD(&ccd, sect_name, "PMin");
+		isoTOC10[i].psec = GetIntCCD(&ccd, sect_name, "PSec");
+		isoTOC10[i].pframe = GetIntCCD(&ccd, sect_name, "PFrame");
+
 		point = GetIntCCD(&ccd, sect_name, "Point");
 
 		if (point == 0xA1)
@@ -1473,6 +1505,56 @@ void BuildTOC()
    isoTOC[101] = (isoTOC[session->track_num - 1] & 0xFF000000) | session->fad_end;
 }
 
+void BuildTOC10()
+{
+   int i;
+   session_info_struct *session=&disc.session[0];
+
+   for (i = 0; i < session->track_num; i++)
+   {
+      isoTOC10[3+i].ctrladr = session->track[i].ctl_addr;
+      isoTOC10[3+i].tno = 0;
+      isoTOC10[3+i].point = i+1;
+      isoTOC10[3+i].min = 0;
+      isoTOC10[3+i].sec = 2;
+      isoTOC10[3+i].frame = 0;
+      isoTOC10[3+i].zero = 0;
+      Cs2FADToMSF(session->track[i].fad_start, &isoTOC10[3+i].pmin, &isoTOC10[3+i].psec, &isoTOC10[3+i].pframe);
+   }
+
+   isoTOC10[0].ctrladr = isoTOC10[3].ctrladr;
+   isoTOC10[0].tno = 0;
+   isoTOC10[0].point = 0xA0;
+   isoTOC10[0].min = 0;
+   isoTOC10[0].sec = 2;
+   isoTOC10[0].frame = 0;
+   isoTOC10[0].zero = 0;
+   isoTOC10[0].pmin = 1;
+   isoTOC10[0].psec = 0;
+   isoTOC10[0].pframe = 0;
+
+   isoTOC10[1].ctrladr = isoTOC10[3+session->track_num-1].ctrladr;
+   isoTOC10[1].tno = 0;
+   isoTOC10[1].point = 0xA1;
+   isoTOC10[1].min = 0;
+   isoTOC10[1].sec = 2;
+   isoTOC10[1].frame = 0;
+   isoTOC10[1].zero = 0;
+   isoTOC10[1].pmin = session->track_num;
+   isoTOC10[1].psec = 0;
+   isoTOC10[1].pframe = 0;
+
+   isoTOC10[2].ctrladr = isoTOC10[1].ctrladr;
+   isoTOC10[2].tno = 0;
+   isoTOC10[2].point = 0xA2;
+   isoTOC10[2].min = 0;
+   isoTOC10[2].sec = 2;
+   isoTOC10[2].frame = 0;
+   isoTOC10[2].zero = 0;
+   Cs2FADToMSF(session->fad_end, &isoTOC10[2].pmin, &isoTOC10[2].psec, &isoTOC10[2].pframe);
+   isoTOCnum = 3+session->track_num;
+}
+
 //////////////////////////////////////////////////////////////////////////////
 
 static int ISOCDInit(const char * iso) {
@@ -1504,12 +1586,14 @@ static int ISOCDInit(const char * iso) {
       imgtype = IMG_BINCUE;
       ret = LoadBinCue(iso, iso_file);
    }
+#ifdef ENABLE_ZLIB
    else if (strcasecmp(ext, ".ZIP") == 0)
    {
       // It's a BIN/CUE
       imgtype = IMG_BINCUE;
       ret = LoadBinCueInZip(iso, iso_file);
    }
+#endif
    else if (strcasecmp(ext, ".MDS") == 0 && strncmp(header, "MEDIA ", sizeof(header)) == 0)
    {
       // It's a MDS
@@ -1522,12 +1606,14 @@ static int ISOCDInit(const char * iso) {
 		imgtype = IMG_CCD;
 		ret = LoadCCD(iso, iso_file);
 	}
+#ifdef ENABLE_CHD
   else if (strcasecmp(ext, ".CHD") == 0)
   {
     // It's a CCD
     imgtype = IMG_CHD;
     ret = LoadCHD(iso, iso_file);
   }
+#endif
    else
    {
       // Assume it's an ISO file
@@ -1546,6 +1632,8 @@ static int ISOCDInit(const char * iso) {
    }
 
    BuildTOC();
+   if (imgtype != IMG_CCD)
+      BuildTOC10();
    return 0;
 }
 
@@ -1624,6 +1712,11 @@ static s32 ISOCDReadTOC(u32 * TOC) {
    return (0xCC * 2);
 }
 
+static s32 ISOCDReadTOC10(CDInterfaceToc10 *TOC) {
+   memcpy(TOC, isoTOC10, 102 * sizeof(CDInterfaceToc10));
+   return isoTOCnum;
+}
+
 //////////////////////////////////////////////////////////////////////////////
 
 track_info_struct *currentTrack = NULL;
@@ -1638,9 +1731,11 @@ static int ISOCDReadSectorFAD(u32 FAD, void *buffer) {
 
    assert(disc.session);
 
+#ifdef ENABLE_CHD
    if (IMG_CHD == imgtype) {
      return ISOCDReadSectorFADFromCHD(FAD,buffer);
    }
+#endif
 
    memset(buffer, 0, 2448);
 
@@ -1770,6 +1865,7 @@ static void ISOCDReadAheadFAD(UNUSED u32 FAD)
 
 //////////////////////////////////////////////////////////////////////////////
 
+#ifdef ENABLE_CHD
 #define CD_MAX_SECTOR_DATA      (2352)
 #define CD_MAX_SUBCODE_DATA     (96)
 #define CD_FRAME_SIZE           (CD_MAX_SECTOR_DATA + CD_MAX_SUBCODE_DATA)
@@ -1923,14 +2019,13 @@ static int LoadCHD(const char *chd_filename, RFILE *iso_file)
     {
       trk[num_tracks].ctl_addr = 0x01;
       trk[num_tracks].sector_size = 2352;
-      //trk[num_tracks].pregap = 0;
     }
    
-    //trk[num_tracks].fad_start = trk[num_tracks].fad_start + pregap;
-    //trk[num_tracks].fad_end = trk[num_tracks].fad_start + (frame - 1) + postgap;
-    //frame = trk[num_tracks].fad_end+1;
+    trk[num_tracks].fad_start = trk[num_tracks].fad_start + pregap;
+    trk[num_tracks].fad_end = trk[num_tracks].fad_start + (frame - 1) - pregap;
+    frame = trk[num_tracks].fad_end+1;
     num_tracks++;
-    //trk[num_tracks].fad_start = frame;
+    trk[num_tracks].fad_start = frame;
   }
   free(buf);
 
@@ -1939,20 +2034,17 @@ static int LoadCHD(const char *chd_filename, RFILE *iso_file)
 
   u32 chdofs = 0;
   u32 physofs = 0;
-  u32 logofs = 150;
+  u32 logofs = 0;
   int i;
   for (i = 0; i < num_tracks; i++)
   {
-    trk[i].fad_start = logofs + trk[i].pregap;
-    
+    trk[i].logframeofs = logofs;
     trk[i].physframeofs = physofs;
     trk[i].chdframeofs = chdofs;
-    trk[i].logframeofs = logofs;
 
-    //logofs += trk[i].pregap;
-    //logofs += trk[i].postgap;
+    logofs += trk[i].pregap;
+    logofs += trk[i].postgap;
     logofs += trk[i].frames;
-    trk[i].fad_end = logofs;
 
     physofs += trk[i].frames;
 
@@ -2000,24 +2092,18 @@ static int ISOCDReadSectorFADFromCHD(u32 FAD, void *buffer) {
   track_info_struct *track = NULL;
   u32 chdlba;
   u32 physlba;
-  u32 loglba = FAD;
+  u32 loglba = FAD - 150;
 
   chdlba = loglba;
   for (i = 0; i < disc.session_num; i++)
   {
     for (j = 0; j < disc.session[i].track_num; j++)
     {
-      //if (j == 1) {
-      //  int a = 0;
-      //}
       if (loglba < disc.session[i].track[j+1].logframeofs) {
-        //if ((loglba > disc.session[i].track[j].pregap)) {
-       //   loglba -= disc.session[i].track[j].pregap;
-       // }
+        if ((loglba > disc.session[i].track[j].pregap)) {
+          loglba -= disc.session[i].track[j].pregap;
+        }
         physlba = disc.session[i].track[j].physframeofs + (loglba - disc.session[i].track[j].logframeofs);
-        //if (disc.session[i].track[j].ctl_addr == 0x01) {
-        //  physlba += disc.session[i].track[j].pregap;
-        //}
         chdlba = physlba - disc.session[i].track[j].physframeofs + disc.session[i].track[j].chdframeofs;
         track = &disc.session[i].track[j];
         break;
@@ -2051,4 +2137,4 @@ static int ISOCDReadSectorFADFromCHD(u32 FAD, void *buffer) {
 
   return 1;
 }
-
+#endif
